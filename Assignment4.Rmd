@@ -1,0 +1,441 @@
+---
+title: "Assignment 4 - Applying meta-analytic priors"
+author: "JSARD"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Assignment 4
+
+In this assignment we do the following:
+- we run a Bayesian meta-analysis of pitch variability in ASD, based on previously published literature
+- we analyze pitch variability in ASD in two new studies using both a conservative and a meta-analytic prior
+- we assess the difference in model quality and estimates using the two priors.
+
+The questions you need to answer are: What are the consequences of using a meta-analytic prior? Evaluate the models with conservative and meta-analytic priors. Discuss the effects on estimates. Discuss the effects on model quality.
+
+Discuss the role that meta-analytic priors should have in scientific practice. Should we systematically use them? Do they have drawbacks? Should we use them to complement more conservative approaches? How does the use of meta-analytic priors you suggest reflect the skeptical and cumulative nature of science?
+
+### Step by step suggestions
+
+Step 1: Perform a meta-analysis of pitch variability from previous studies of voice in ASD
+- the data is available as Ass4_MetaAnalysisData.tsv
+- You should calculate Effect size (cohen's d) and Standard Error (uncertainty in the Cohen's d) per each study, using escalc() from the metafor package (also check the livecoding intro)
+- N.B. we're only interested in getting a meta-analytic effect size for the meta-analytic prior (and not e.g. all the stuff on publication bias). See a brms tutorial here: https://vuorre.netlify.com/post/2016/09/29/meta-analysis-is-a-special-case-of-bayesian-multilevel-modeling/ The formula is EffectSize | se(StandardError) ~ 1 + (1 | Paper). Don't forget prior definition, model checking, etc.
+- Write down the results of the meta-analysis in terms of a prior for step 2.
+
+```{r Step 1}
+
+set.seed(555)
+
+##### LOADING DATA
+
+## Loading packages
+pacman::p_load(pacman, tidyverse, metafor, brms, lme4) # We'll need metafor to use the escalc function.
+
+## Loading meta-analysis data
+meta_data <- read.delim("Ass4_MetaAnalysisData.tsv")
+
+## Inspecting the data.
+head(meta_data)
+View(meta_data)
+
+####### COMPUTING COHEN'S D.
+
+# Our variable of interest is Pitch Variability. Let's reduce the dataframe a little bit to make it more manageable:
+
+pvar_data <- meta_data %>% select(Paper, ASD_N, TD_N, Population, PitchVariability_Units, PitchVariabilityASD_Mean, PitchVariabilityASD_SD, PitchVariabilityTD_Mean, PitchVariabilityTD_SD)
+
+View(pvar_data)
+
+# Well, we'll want to remove NA's.
+
+pvar_clean <- pvar_data %>% subset(!is.na(ASD_N)) # There are more NA's in some of the data rows, but escalc can (seemingly) deal with this.
+
+## Now we can estimate cohen's D using escalc.
+
+es_pvar <- escalc('SMD', # Also known as Cohen's d
+                      n1i = ASD_N,
+                      n2i = TD_N,
+                      m1i = PitchVariabilityASD_Mean, 
+                      m2i = PitchVariabilityTD_Mean,
+                      sd1i = PitchVariabilityASD_SD, 
+                      sd2i = PitchVariabilityTD_SD,
+                      data = pvar_clean,
+                      slab = Population) # For plotting purposes
+
+# es_pvar now contains columns for yi and vi (SMD and variance for every study i)
+
+# to get sei we have to simply estimate the standard deviation of each study's true distribution (or whatever). vi is the sd squared, so:
+
+es_pvar <- es_pvar %>% mutate(
+  sei = sqrt(vi)
+)
+
+# Here's a nice plot: # Yaaaay
+ggplot(es_pvar, aes(x=yi, y=Population)) +
+  geom_segment(aes(x = yi-sei*2, xend = yi+sei*2, y=Population, yend=Population)) +
+  geom_point()
+
+
+# First, the Bayesian formula. We have been given this already:
+
+pvar_f <- bf(yi | se(sei) ~ 1 + (1 | Population)) # And there was much rejoicing
+
+## Let's figure out what priors we'll need:
+
+get_prior(pvar_f, family = gaussian, es_pvar) # Right, an intercept and a standard deviation.
+
+## Let's make those!
+
+pvar_priors <- c(
+  prior(normal(0, .5), class = Intercept),
+  prior(normal(0, .3), class = sd)
+)
+
+ma_m0 <- brm(
+  formula = pvar_f, 
+  prior = pvar_priors,
+  data = es_pvar,
+  chains = 2,
+  cores = 2,
+  sample_prior = "only"
+)
+
+## Prior predictive check
+pp_check(brm_priors, nsamples = 100)
+
+## The actual model:
+
+ma_m1 <- brm(
+  formula = pvar_f, 
+  prior = pvar_priors,
+  data = es_pvar,
+  chains = 2,
+  cores = 2,
+  sample_prior = T
+)
+
+## Posterior predictive check
+pp_check(ma_m1, nsamples = 100)
+
+
+
+## Model summary
+summary(ma_m1)
+
+# So if we wanted to turn this into a prior for the next analysis, I suppose this would be:
+
+meta_prior <- c(
+  prior(normal(0.42, 0.09), class = Intercept), # We need to be certain of the directionality of the effect.
+  prior(normal(0.32, 0.10), class = sd)
+)
+
+
+(ma_m1_mean <- fixef(ma_m1)[[1]])
+(ma_m1_sd <- fixef(ma_m1)[[2]])
+(ma_m1_het <- summary(ma_m1)$random$Population[[1]])
+(ma_m2_het <- summary(ma_m1)$random$Population[[2]])
+
+# PLOTS!... maybe
+
+
+```
+
+Step 2: Analyse pitch variability in ASD in two new studies for which you have access to all the trials (not just study level estimates)
+- the data is available as Ass4_data.csv. Notice there are 2 studies (language us, and language dk), multiple trials per participant, and a few different ways to measure pitch variability (if in doubt, focus on pitch IQR, interquartile range of the log of fundamental frequency)
+- Also, let's standardize the data, so that they are compatible with our meta-analytic prior (Cohen's d is measured in SDs).
+- Is there any structure in the dataset that we should account for with random/varying effects? How would you implement that? Or, if you don't know how to do bayesian random/varying effects or don't want to bother, is there anything we would need to simplify in the dataset?
+
+```{r}
+## Loading the data
+
+pacman::p_load(readr)
+new_data <- read_csv("Ass4_data.csv", col_types = cols(
+  ID = col_character()
+))
+View(new_data)
+
+## Scaling our variable of choice (Pitch IQR):
+
+scaled_data <- new_data %>% mutate(
+  PitchVariability = scale(Pitch_IQR)
+)
+
+hist(scaled_data$Pitch_IQR)
+
+hist(log(scaled_data$Pitch_IQR))
+
+hist(scaled_data$PitchVariability) # <--- Totally gaussian.
+
+## Possible random/fixed effects? What structural effects do we need to take into account?
+
+# Language. And then, of course, random effects by participants would be my guess.
+
+```
+
+Step 3: Build a regression model predicting Pitch variability from Diagnosis.
+- how is the outcome distributed? (likelihood function). NB. given we are standardizing, and the meta-analysis is on that scale, gaussian is not a bad assumption. Lognormal would require us to convert the prior to that scale.
+- how are the parameters of the likelihood distribution distributed? Which predictors should they be conditioned on? Start simple, with Diagnosis only. Add other predictors only if you have the time and energy!
+- use a skeptical/conservative prior for the effects of diagnosis. Remember you'll need to motivate it.
+- Evaluate model quality. Describe and plot the estimates. 
+
+
+Step 4: Now re-run the model with the meta-analytic prior
+- Evaluate model quality. Describe and plot the estimates. 
+
+```{r}
+
+# So, as we saw above, standardized IQR is kiiiinda log-normal in its distribution. The prior, however, is Gaussian.
+
+# For lack of a better option, we choose to assume a gaussian distribution of the outcome. GAUSSIAN, I CHOOSE YOU!
+
+set.seed(555)
+
+levels(as.factor(scaled_data$Diagnosis)) # Importantly, ASD is 0 and TD is 1. AKA, ASD will be the intercept, and the slope will be TD - ASD, or DiagnosisTD
+
+##### RE-LOADING PACKAGES
+
+## Loading packages
+pacman::p_load(pacman, tidyverse, metafor, brms, lme4)
+
+## First, we want to build the model, starting with the formula:
+
+diag_f <- bf(PitchVariability ~ Diagnosis + (1|ID)) # Only random intercept; each participant doesn't actually change between the two. Diagnosis is not an experimental manipulation!
+
+## Let's figure out what priors we'll need:
+
+get_prior(diag_f, family = gaussian, scaled_data)
+
+
+# Beta, Intercept, Sigma as usual, plus an sd (parameter for random effect)
+
+summary(scaled_data$PitchVariability) # Since we've scaled the data, the mean is definitively at 0, but with some pretty wide tails (and not symmetric, unfortunately).
+
+# this means that, if we expect beta to be 0 (no effect of diagnosis), then we expect the two populations to both have the same mean (0, since the data is scaled). Thus, our prior for the intercept (which is the mean of )
+
+#Likewise, we expect that the variation within
+
+skeptical_prior <- c(
+  prior(normal(0, .3), class = Intercept),
+  prior(normal(0, .1), class = b),
+  prior(normal(0, .1), class = sd), # This one is weird to interpret. Riccardo said something about "not differing more from eachother than they do from the mean" or something. So we'll be skeptical about that I guess.
+  prior(normal(0, .6), class = sigma)
+)
+
+
+(ma_m1_mean)
+(ma_m1_sd )
+(ma_m1_het)
+(ma_m2_het)
+
+
+meta_prior <- c(
+  prior(normal(0, .3), class = Intercept),
+  prior(normal(.42, .09 ), class = b),
+  prior(normal(0, .1), class = sd),
+  prior(normal(.32, 0.1), class = sigma)
+)
+
+
+## Running the whole shebang.
+
+
+skep_mod0 <- brm(
+  formula = diag_f, 
+  prior = skeptical_prior,
+  data = scaled_data,
+  chains = 2,
+  cores = 2,
+  sample_prior = "only"
+)
+
+
+## Prior predictive check
+pp_check(skep_mod0, nsamples = 100) # Very much completely nightmarish.
+
+
+
+## The actual model:
+
+skep_mod1 <- brm(
+  formula = diag_f, 
+  prior = skeptical_prior,
+  data = scaled_data,
+  chains = 2,
+  cores = 2,
+  sample_prior = T
+)
+
+## Posterior predictive check
+pp_check(skep_mod1, nsamples = 100)
+## Model summary
+summary(skep_mod1) # Didn't get any warnings! Suspicious Rhat activity for the random effects however. Bad priors maybe?
+
+plot(skep_mod1) # Looks soooooomewhat okay
+
+
+## Model with meta-analytic prior:
+
+meta_mod0 <- brm(
+  formula = diag_f, 
+  prior = meta_prior,
+  data = scaled_data,
+  chains = 2,
+  cores = 2,
+  sample_prior = "only"
+)
+
+
+## Prior predictive check
+pp_check(meta_mod0, nsamples = 100) # not completely nightmarish.
+
+## The actual model:
+
+meta_mod1 <- brm(
+  formula = diag_f, 
+  prior = meta_prior,
+  data = scaled_data,
+  chains = 2,
+  cores = 2,
+  sample_prior = T
+)
+
+## Posterior predictive check
+pp_check(meta_mod1, nsamples = 100)
+
+## Model summary
+summary(meta_mod1) 
+
+## chainplot
+plot(meta_mod1)
+
+```
+
+Step 5: Compare the models
+- Plot priors and posteriors of the diagnosis effect in both models
+- Compare posteriors between the two models
+- Compare the two models (LOO)
+- Discuss how they compare and whether any of them is best. # Well, they make different predictions for one. ## I was here. ### Here I go again.
+
+```{r}
+
+##### ALL THE MODEL COMPARISON AND QUALITY STUFF
+
+set.seed(555)
+### Plotting priors and posteriors and comparing! (Using the ancient chinese art of eyeballing the data).
+
+## What is our hypothesis?
+
+# Probably that we expect a positive effect on PitchVar by "going from" ASD to TD. Because ASD's might speak a little bit more monotonically.
+
+# Hypothesis testing + updating check
+
+hypothesis(skep_mod1,"DiagnosisTD = 0") # Posterior probability of .42 that beta (DiagnosisTD) = 0. Hmmmm, not exactly encouraging.
+
+plot(hypothesis(skep_mod1, "DiagnosisTD = 0")) # Shows slight shift to the left, but not much of an effect.
+
+conditional_effects(skep_mod1) # Overlapping errorbars. If there is an effect (Which seems slightly unlikely), it is very smol.
+
+plot(conditional_effects(skep_mod1), points=T) # Loads of overlap in the data, and overlapping errorbars
+
+
+# Hypothesis testing + updating check
+plot(hypothesis(meta_mod1, "DiagnosisTD > 0")) # This would imply, that we expect a positive effect on PitchVar by "going from" ASD to TD.
+
+
+hypothesis(meta_mod1, "DiagnosisTD > 0")
+
+conditional_effects(meta_mod1)
+
+plot(conditional_effects(meta_mod1), points=T)
+
+
+# LOO STUFF
+
+skep_loo <- loo(skep_mod1, reloo = T)
+
+summary(skep_loo)
+skep_loo
+
+
+big_loo <- loo(skep_mod1, meta_mod1, reloo = T)
+big_loo # Model quality is okay.
+summary(big_loo)
+
+
+loo_model_weights(skep_mod1, meta_mod1, reloo = T) # Skep_mod is getting slammed. meta_mod is better.
+
+
+
+
+```
+
+### So, some quick notes:
+
+- Posteriors move around a lot. When using the meta-analytic prior we see a positive effect. Vice versa with the other prior (or, really, no effect with the prior).
+
+- Loo_model_weights seemed to indicate that the meta-analytic prior made the model better... by some obscure metric.
+
+- We don't quite know how to interpret looic and looelpd, but it appears that the meta_mod is sliiiiiiiightly better.
+
+yay
+
+The questions you need to answer are: What are the consequences of using a meta-analytic prior? Evaluate the models with conservative and meta-analytic priors. Discuss the effects on estimates. Discuss the effects on model quality. Discuss the role that meta-analytic priors should have in scientific practice. Should we systematically use them? Do they have drawbacks? Should we use them to complement more conservative approaches? How does the use of meta-analytic priors you suggest reflect the skeptical and cumulative nature of science?
+
+
+
+```{r}
+
+
+
+
+```
+
+
+Step 6: Prepare a nice write up of the analysis and answer the questions at the top.
+
+Optional step 7: how skeptical should a prior be?
+- Try different levels of skepticism and compare them using LOO.
+
+Optional step 8: Include other predictors
+- Do age, gender and education improve the model?
+- Should they be main effects or interactions?
+
+
+
+```{r}
+
+# Pitch Mean (Hz, "")
+levels(meta_data$PitchMean_Units)
+
+# Pitch Range (Hz, Standard Deviations, semitones)
+levels(meta_data$PitchRange_Units)
+
+# Pitch Standard Deviation (Hz, Standard Deviations)
+levels(meta_data$PitchSD_Units)
+
+# Pitch Variability (Hz, Stadard Deviations, semitones)
+levels(meta_data$PitchVariability_Units)
+
+# Intensity Mean (dB)
+levels(meta_data$IntensityMean_Units)
+
+# Utterance Duration (s)
+levels(meta_data$UtteranceDurationUnit)
+
+# Syllable Duration (Presumably seconds?)
+
+# Speech Rate (Syllables per Minute, Syllables per Second)
+levels(meta_data$SpeechRate_Units)
+
+# Length of Pauses (Presumably seconds?)
+
+# Number of Pauses (Pauses, of course)
+
+
+glimpse(meta_data) # Loads of missing data on several variables; the pitch variables appear to have a decent amount though.
+```
